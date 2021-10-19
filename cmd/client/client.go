@@ -39,7 +39,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
+	"net"
+
+	//	"os"
 	"sync"
 	"time"
 
@@ -51,13 +53,15 @@ import (
 	tpb "github.com/openconfig/grpctunnel/proto/tunnel"
 )
 
+// client -tunnel_server_address "localhost:5555" -dial_target "target1" -dial_target_type "http" -tcp_server_addr "localhost:5000"
 var (
-	tunnelAddress  = flag.String("tunnel_server_address", "", "The address of the tunnel")
-	dialTarget     = flag.String("dial_target", "", "The client uses target to register at the server.")
-	dialTargetType = flag.String("dial_target_type", "", "The type of target protocol, e.g. GNMI or SSH.")
+	tunnelAddress  = flag.String("tunnel_server_address", "localhost:5555", "The address of the tunnel")
+	dialTarget     = flag.String("dial_target", "target1", "The client uses target to register at the server.")
+	dialTargetType = flag.String("dial_target_type", "HTTP", "The type of target protocol, e.g. GNMI or SSH.")
 	certFile       = flag.String("cert_file", "", "The certificate file location. If both cert_file and key_file are provided, mTLS will be used.")
 	keyFile        = flag.String("key_file", "", "The private key file location. If both cert_file and key_file are provided, mTLS will be used.")
 	caFile         = flag.String("ca_file", "", "The CA file location.")
+	listenAddress  = flag.String("tcp_server_addr", "localhost:5000", "The address of TCP server (e.g. \"localhost:5555\")")
 
 	// for setting retry backoff when waiting for target.
 	retryBaseDelay     = time.Second
@@ -72,7 +76,8 @@ type config struct {
 	keyFile,
 	certFile,
 	dialTarget, // The remote target to dial
-	dialTargetType string // The remote target type to dial
+	dialTargetType, // The remote target type to dial
+	listenAddress string // The local socket server where realc SSH/gNMI clients can connect
 }
 
 type stdIOConn struct {
@@ -89,9 +94,61 @@ func getBackOff() *backoff.ExponentialBackOff {
 	return bo
 }
 
+func listen(ctx context.Context, client *tunnel.Client, listenAddress string, dialTarget tunnel.Target) error {
+	l, err := net.Listen("tcp", listenAddress)
+	if err != nil {
+		return fmt.Errorf("failed to listen: %s: %v", listenAddress, err)
+	}
+	defer l.Close()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("failed to accept connection: %v", err):
+				default:
+				}
+				return
+			}
+			// Errors from this goroutine will be logged only, because we don't want an
+			// underlying stream issue to tear the client down
+			go func(conn net.Conn) {
+				defer conn.Close()
+				log.Printf("received connection. trying a new session.")
+
+				session, err := client.NewSession(dialTarget)
+				if err != nil {
+					log.Printf("error from new session: %v", err)
+					return
+				}
+
+				if err = bidi.Copy(session, conn); err != nil {
+					log.Printf("error from bidi copy: %v", err)
+				}
+			}(conn)
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-errCh:
+		return err
+	}
+}
+
 // Run starts a tunnel client, connecting to the tunnel server via the provided tunnel address.
 // The client uses the target to identify whether it can handle the target (u) sent by the server.
 func run(ctx context.Context, conf config) error {
+	fmt.Printf("Will connect on Tunnel gRPC server '%s' and will use target '%s' and target-type '%s'\n",
+		conf.tunnelAddress, conf.dialTarget, conf.dialTargetType)
+	fmt.Printf("Will listen on socket server '%s' for real client\n", conf.listenAddress)
+
 	var opts []grpc.DialOption
 	var err error
 	if len(conf.certFile) == 0 || len(conf.keyFile) == 0 {
@@ -173,22 +230,36 @@ func run(ctx context.Context, conf config) error {
 			time.Sleep(wait)
 		}
 
-		session, err := client.NewSession(dialTarget)
-		if err != nil {
-			log.Printf("error from new session: %v", err)
+		if err := listen(ctx, client, conf.listenAddress, dialTarget); err != nil {
 			errCh <- err
-			return
 		}
-		log.Printf("new session established for target: %s\n", dialTarget)
-
-		// Once a tunnel session is established, it connects it to a stdio.
-		stdio := &stdIOConn{Reader: os.Stdin, WriteCloser: os.Stdout}
-		if err = bidi.Copy(session, stdio); err != nil {
-			log.Printf("error from bidi copy: %v\n", err)
-			return
-		}
-
 	}()
+	/*
+		go func() {
+			bo := getBackOff()
+			for !foundDialTarget() {
+				wait := bo.NextBackOff()
+				log.Printf("dial target %s (type: %s) not found. reconnecting in %s (all targets found: %s) \n", conf.dialTarget, conf.dialTargetType, wait, peers)
+				time.Sleep(wait)
+			}
+
+			session, err := client.NewSession(dialTarget)
+			if err != nil {
+				log.Printf("error from new session: %v", err)
+				errCh <- err
+				return
+			}
+			log.Printf("new session established for target: %s\n", dialTarget)
+
+			// Once a tunnel session is established, it connects it to a stdio.
+			stdio := &stdIOConn{Reader: os.Stdin, WriteCloser: os.Stdout}
+			if err = bidi.Copy(session, stdio); err != nil {
+				log.Printf("error from bidi copy: %v\n", err)
+				return
+			}
+
+		}()
+	*/
 
 	// Listen for any request to create a new session.
 	select {
@@ -208,6 +279,7 @@ func main() {
 		certFile:       *certFile,
 		keyFile:        *keyFile,
 		caFile:         *caFile,
+		listenAddress:  *listenAddress,
 	}); err != nil {
 		log.Fatal(err)
 	}
